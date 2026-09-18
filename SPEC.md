@@ -35,9 +35,10 @@ internal/tools/bin/
 ```
 
 The macOS tools are thin Mach-O files, not universal binaries. Upstream ships
-texconv-macos and 7zz-macos fat, and `build_flavor.sh batch universal` produces
-a fat compressonator; `lipo -thin` splits each one and the two halves are
-committed side by side. A darwin build then embeds only the slice it can run.
+texconv-macos and 7zz-macos fat, so `lipo -thin` splits each into the two
+committed halves. compressonator-bc7e is built here and builds one slice per
+run, so it needs no splitting. A darwin build embeds only the slice it can
+run.
 
 All three platforms ship compressonator-bc7e. `Extract()` still writes the
 binary only when the embedded data is non-empty, and callers must check
@@ -53,15 +54,22 @@ branch `bc7enc-rdo-integration`). Two commands reproduce the shipped
 artifacts, one per architecture:
 
 ```sh
-compressonator/tools/macos/build_flavor.sh batch arm64
-compressonator/tools/macos/build_flavor.sh batch x86_64
+B=internal/tools/bin/compressonator-bc7e-macos
+OUTPUT=$B-arm64 compressonator/tools/macos/build_flavor.sh batch arm64
+OUTPUT=$B-amd64 compressonator/tools/macos/build_flavor.sh batch x86_64
 ```
 
-Each run builds one slice and ad-hoc signs it with `--identifier
-compressonatorcli`. Nothing joins them afterwards, because atak embeds the two
-slices separately. Passing `universal` still works and still runs `lipo
--create`; the two committed files came from one such run, split back apart with
-`lipo -thin`, which is why both carry a single build's ISPC timestamps.
+Each run builds one slice, ad-hoc signs it with `--identifier
+compressonatorcli`, and writes it where `OUTPUT=` points. Nothing joins them
+afterwards, because atak embeds the two slices separately. The file names end
+in amd64 because Go names that architecture amd64; the Mach-O slice inside is
+x86_64.
+
+The two committed files came from one `batch universal` run split with `lipo
+-thin`, so both carry the same build's ISPC timestamps. The two commands above
+reproduce them to within those timestamps, the `LC_UUID` derived from them, and
+the signature page hashes covering both: 82 differing bytes of 2,659,568 on
+arm64 and 152 of 3,999,328 on x86_64, with byte-identical encoder output.
 
 The script's own header documents the directory layout it expects and the four
 setup steps that precede it: clone bc7enc_rdo, apply bc7enc_rdo#29, unpack ISPC
