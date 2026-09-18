@@ -39,11 +39,23 @@ from needing changes anywhere but `embed_<platform>.go`.
 
 ### Building compressonator-bc7e for macOS
 
-The fork's README §8 lists macOS as out of scope, so the macOS binary is built
-from source with `tools/macos/build_flavor.sh` in the fork
-(`noisethanks/compressonator`, branch `bc7enc-rdo-integration`). One build per
-architecture, joined with `lipo -create` and ad-hoc signed, matching how
-texconv-macos and 7zz-macos ship.
+AMD ships no macOS build, so the macOS binary is built from source with
+`tools/macos/build_flavor.sh` in the fork (`noisethanks/compressonator`,
+branch `bc7enc-rdo-integration`). One command reproduces the shipped artifact:
+
+```sh
+compressonator/tools/macos/build_flavor.sh batch universal
+```
+
+That builds one slice per architecture, joins them with `lipo -create`, and
+ad-hoc signs the result with `--identifier compressonatorcli`, matching how
+texconv-macos and 7zz-macos ship. The script's own header documents the
+directory layout it expects and the four setup steps that precede it: clone
+bc7enc_rdo, apply bc7enc_rdo#29, unpack ISPC v1.31.0, and run
+`python3 build/fetch_dependencies.py`. That last one is not optional even for
+a CLI-only build, because `external/CMakeLists.txt` resolves glm and rapidxml
+for any build with `OPTION_BUILD_APPS_CMP_CLI` on, whatever the OpenGL and Qt
+flags are set to.
 
 **The ISPC host architecture decides whether the encoder is correct.** ISPC
 1.19 and later, when the *compiler itself* is an aarch64 build, silently
@@ -66,9 +78,22 @@ Two independent routes avoid it, and `build_flavor.sh` accepts either:
 2. **Use the macOS x86_64 ISPC package**, which runs under Rosetta 2 on Apple
    Silicon.
 
-The script refuses only the unsafe combination — an arm64 ISPC against a
-bc7e.ispc that still carries the bare decrements. The shipped binary was built
-both ways at once: PR #29 applied, x86_64 ISPC 1.31.0 host.
+Route 1 alone is enough, and it is the simpler recipe. Whether an ISPC can
+emit a given architecture depends on the LLVM it was built against, not on its
+own Mach-O slice: the official `ispc-v1.31.0-macOS.arm64` package cross-compiles
+the x86_64 slice, so Apple Silicon needs neither Rosetta 2 nor the larger
+universal package. Homebrew's `ispc` is the exception, because it links
+`llvm@22` and rejects `--arch=x86-64` outright; the script compiles a throwaway
+kernel per requested slice to catch that in the first second.
+
+Rather than infer the defect from the host architecture, the script compiles a
+six-line kernel that exercises `x--` on a varying unsigned int and checks the
+result, in about 0.1 s. It refuses only the combination that measurement shows
+is unsafe: a compiler that demonstrably drops the decrement, against a
+bc7e.ispc that still uses it. ISPC 1.31.0 miscompiles it on any aarch64 host,
+the official package included, so PR #29 is required in practice on Apple
+Silicon. The shipped binary was built with PR #29 applied and an
+`ispc-v1.31.0-macOS.arm64` host.
 
 Other fixes carried in the fork, all upstream defects rather than fork changes.
 The first four are macOS-specific; the threading one is not:
@@ -107,8 +132,19 @@ The first four are macOS-specific; the threading one is not:
 through bc7e's NEON target and the scalar BC1/BC3/BC4/BC5 kernels compiled for
 arm64; both differ in the low bits from the SSE/AVX build. Measured on a mixed
 corpus, 18 of 38 format/mip configurations differ byte-wise between the two
-macOS slices, while PSNR tracks to within ±0.1 dB. Output is reproducible
-within a slice: the same input gives the same bytes on every run.
+macOS slices, while PSNR tracks to within ±0.1 dB. Output is reproducible for
+a given binary: the same input gives the same bytes on every run.
+
+The binary itself is deterministic in its code but not bit-reproducible. Two
+builds from identical sources on one machine differ only in a 4-byte Unix
+timestamp per compiled ISPC target (four in the x86_64 slice, one in arm64)
+and in the `LC_UUID` computed downstream of it. Encoder output across those
+two builds is byte-identical. Change the toolchain, however, and the encoder
+moves: rebuilding under a newer Xcode differs from the previously shipped
+binary in 12 of 241,584 pixels on a 719x336 test image, at 57.227 dB either
+way. A golden output hash would therefore track the toolchain rather than
+correctness, which is why the checks live in `build_flavor.sh` as assertions
+on linkage, architecture and deployment target instead.
 
 Against the stock codec on the same machine, bc7e matches on quality and wins
 decisively on time — within ±0.7 dB either way across the corpus, and 0.54 s
@@ -135,11 +171,21 @@ On startup:
 3. Store paths in an `EmbeddedTools` struct passed through the app
 4. `defer tools.Cleanup()` in main
 
-**Binary size:** compressonator-bc7e adds ~9MB on Linux, ~6.4MB on macOS (two
-slices in one universal binary) and ~3.5MB on Windows. Current stripped
-(`-s -w`) sizes: macOS ~22MB, Linux ~20MB, Windows ~11MB — all under the
-historical 25MB target, with macOS now the tightest. Watch this ceiling if
-further binaries land.
+**Binary size:** compressonator-bc7e adds ~9MB on Linux, 6,690,032 bytes on
+macOS (two slices in one universal binary) and ~3.5MB on Windows. Current
+stripped (`-s -w`) sizes: darwin/arm64 24,161,442 bytes and darwin/amd64
+24,281,264 bytes, Linux ~20MB, Windows ~11MB — all under the historical 25MB
+target, with macOS the tightest at roughly 0.8MB of headroom. Watch this
+ceiling if further binaries land.
+
+Each macOS build carries a dead slice of every embedded tool, since the tools
+are embedded per GOOS while the release now ships per GOARCH. The three macOS
+tools total 18.24MiB, about half of which is unreachable in any one build.
+Splitting `embed_darwin.go` into `embed_darwin_amd64.go` and
+`embed_darwin_arm64.go` would recover roughly 9MiB and remove the `lipo
+-create` step from the build recipe. Not done: the ceiling is not binding
+today, and it would need verifying that an x86-64 atak on Apple Silicon still
+spawns the tools it expects.
 
 No other runtime dependencies. The binary must run on any supported platform
 without the user installing anything.
