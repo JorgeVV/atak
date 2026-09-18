@@ -1,6 +1,7 @@
 package screens
 
 import (
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/bubbletea"
@@ -9,26 +10,51 @@ import (
 	"github.com/noisethanks/atak/internal/tui/style"
 )
 
-// WelcomeModel handles first-run path configuration.
+// WelcomeModel handles first-run path configuration and re-configuration when a
+// previously set path is no longer valid.
 type WelcomeModel struct {
 	cfg       *config.Config
 	modsInput textinput.Model
 	bkupInput textinput.Model
 	focused   int // 0 = mods, 1 = backup
+	notice    string
 	width     int
 	height    int
 	err       string
 }
 
 func NewWelcome(cfg *config.Config) WelcomeModel {
+	return NewWelcomeWithNotice(cfg, "")
+}
+
+// welcomePlaceholders returns the OS-appropriate placeholder text for the mods
+// and backup directory inputs. Pulled out as a pure function of goos (rather
+// than reading runtime.GOOS inline) so both branches can be exercised from a
+// single test run regardless of which OS is actually running the tests.
+func welcomePlaceholders(goos string) (mods, backup string) {
+	if goos == "windows" {
+		return `C:\Games\GAMMA\mods`, `C:\Users\user\backups`
+	}
+	return "/home/user/Games/GAMMA/mods", "/home/user/backups"
+}
+
+// NewWelcomeWithNotice creates the welcome screen with an optional notice shown
+// above the path inputs. Used when routing here because a configured path is no
+// longer valid; pass an empty string for the normal first-run case.
+func NewWelcomeWithNotice(cfg *config.Config, notice string) WelcomeModel {
+	// Placeholders mirror the GAMMA-convention candidates detectModsDir()
+	// already looks for, per-OS, so first-run users see a path shaped like
+	// the one the tool would actually have auto-detected.
+	modsPlaceholder, bkupPlaceholder := welcomePlaceholders(runtime.GOOS)
+
 	mods := textinput.New()
-	mods.Placeholder = "/home/user/Games/Anomaly/mods"
+	mods.Placeholder = modsPlaceholder
 	mods.SetValue(cfg.ModsDir)
 	mods.Focus()
 	mods.Width = 60
 
 	bkup := textinput.New()
-	bkup.Placeholder = "/home/user/backups"
+	bkup.Placeholder = bkupPlaceholder
 	bkup.SetValue(cfg.BackupDir)
 	bkup.Width = 60
 
@@ -36,6 +62,7 @@ func NewWelcome(cfg *config.Config) WelcomeModel {
 		cfg:       cfg,
 		modsInput: mods,
 		bkupInput: bkup,
+		notice:    notice,
 	}
 }
 
@@ -105,7 +132,11 @@ func (m WelcomeModel) View() string {
 	var b strings.Builder
 	b.WriteString(style.StyleTitle.Render("atak") + "\n")
 	b.WriteString(style.StyleSubtitle.Render("S.T.A.L.K.E.R. Anomaly texture compressor & backup tool") + "\n\n")
-	b.WriteString(style.StyleBody.Render("Welcome! Let's set up your paths before we begin.") + "\n\n")
+	if m.notice != "" {
+		b.WriteString(style.StyleWarning.Render(m.notice) + "\n\n")
+	} else {
+		b.WriteString(style.StyleBody.Render("Welcome! Let's set up your paths before we begin.") + "\n\n")
+	}
 
 	b.WriteString(style.StyleSelected.Render("Anomaly Mods Directory") + "\n")
 	b.WriteString(m.modsInput.View() + "\n\n")

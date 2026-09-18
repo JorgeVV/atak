@@ -9,6 +9,10 @@ S.T.A.L.K.E.R. Anomaly and its modpacks represent a labor of love by hundreds of
 
 Works with GAMMA, EFP, and any Anomaly-based modpack.
 
+As of 0.3.0, atak now ships with a second backend option, our fork of AMD compressonator with Richard Gelreich's excellent BC7 encoder. This backend boasts slightly higher quality output than texconv and 20x-200x faster. It's CPU only with SIMD acceleration. It's the default, and we highly recommend it. For GPU accelerated compression on Windows only, switch to texconv.
+- https://github.com/richgel999/bc7enc_rdo
+- https://github.com/noisethanks/compressonator
+
 ---
 
 ## Download
@@ -19,7 +23,8 @@ Grab the latest binary for your platform from [Releases](https://github.com/nois
 |---|---|
 | Linux x86-64 | `atak-vX.X.X-linux-x64.tar.gz` |
 | Windows x86-64 | `atak-vX.X.X-windows-x64.zip` |
-| macOS (Intel + Apple Silicon) | `atak-vX.X.X-macos.tar.gz` |
+| macOS Apple Silicon | `atak-vX.X.X-macos-arm64.tar.gz` |
+| macOS Intel | `atak-vX.X.X-macos-x64.tar.gz` |
 
 No installation required.
 
@@ -45,7 +50,7 @@ ATAK defaults to **Mod Output Mode** — a non-destructive workflow that outputs
 4. Go to **Backup Manager** and create a backup — still recommended as a safety net
 5. Go to **Scan & Compress** and press **[r]** to compress everything
 6. Add the output folder (e.g. `mods/ATAK/`) as a mod in MO2
-7. Place it at the **top** of your load order and enable it
+7. Place it at the **highest priority** of your load order and enable it
 
 **To compress in-place instead** (replaces original files — make a backup first):
 Disable Mod Output Mode in Settings. Then follow the backup-first workflow below.
@@ -57,7 +62,35 @@ Disable Mod Output Mode in Settings. Then follow the backup-first workflow below
 4. If happy, press **[r]** to compress everything
 5. If something looks wrong, restore from backup
 
+- Cancelling a compression job deletes the in-progress file — originals untouched
+- Mod Output Mode without a valid modlist.txt will show 0 textures — check Settings if this happens
+
 ---
+## Tips
+
+### Compatibility
+
+- ATAK was tested with G.A.M.M.A but should support most mods and mod packs. Feel free to report any bugs in the issue tracker.
+- Texconv does not support GPU acceleration on Linux, and will likely take several hours to complete. I highly recommend using compressonator_bc7e instead.
+- compressonator_bc7e is SIMD enabled and will very aggressively utilize your CPU cores. We highly reccomend killing background processes and setting your worker threads to 1-2.
+- UI and Icon textures are incompatibile with BC7 in the xray-monolith engine. We recommend leaving them as 'BC3_UNORM'
+
+### Backups
+
+- Backup functionality isn't necessary in mod output mode, which leaves your original mods installations intact. We highly recommend making a backup before using in-line mode.
+- Backup Compression level default is 1. Increasing it reduces your archive size by a few gigabytes, but will take much longer. YMMV.
+- 7-Zip backup progress is sparse on large solid archives — the archive is growing even when the progress bar appears stuck
+
+### Tuning
+- The default profiles should satisfy most users, but can be tuned for your individual case.
+- Users with less than 8GB VRAM budget can use downscaling to get even more VRAM savings.
+- We recommend against downscaling AND using BC7. Replace 'BC7_UNORM' with 'BC3_UNORM'. It may introduce severe artifacting, but tinkering is encouraged.
+- MIP chains clamp your VRAM usage to the Texture MIP bias setting.
+
+### DirextX 9
+- DirectX 9 does not support BC7. If you use DirectX 9, be sure to set every BC7_UNORM profile to BC3_UNORM.
+
+- Keep reading for more details and advanced functionality.
 
 ## What it does
 
@@ -93,7 +126,7 @@ Default profiles cover the most common texture categories:
 | Items | BC3 | `textures/items/`, `textures/item/`, `textures/usable_items/` paths |
 | Particle / FX | BC3 | `textures/semitone/` path |
 
-Already-compressed textures (~24,000 in a typical Anomaly install) are detected and skipped automatically.
+Already-compressed textures (~24,000 in a typical G.A.M.M.A install) are detected and skipped automatically.
 
 **Unmatched textures are never touched.** Files that don't match any profile are shown in scan results but excluded from compression. Add patterns to `profiles.json` to include them.
 
@@ -134,8 +167,7 @@ Config lives at:
   "modsDir": "/path/to/Anomaly/mods",
   "backupDir": "/path/to/backups",
   "workerCount": 1,
-  "backupThreads": 4,
-  "backupLevel": 6,
+  "backupLevel": 1,
   "scanExclusions": [".*", "downloads", "Downloads", "G.A.M.M.A. UI"],
   "modOutputMode": true,
   "modOutputName": "ATAK",
@@ -145,8 +177,7 @@ Config lives at:
 ```
 
 - `workerCount` — concurrent texconv processes (compression only). Each worker pegs one CPU core. Default: 1
-- `backupThreads` — 7-Zip thread count for backup/restore operations. Default: half your CPU threads
-- `backupLevel` — 7-Zip compression level 1-9. Default: 6
+- `backupLevel` — 7-Zip compression level 1-9. Default: 1
 - `scanExclusions` — directories to skip during scan. A plain name (`downloads`, `.*`) matches a directory or mod name anywhere; a path pattern (`*/textures/ui/SquareDOV`) matches a nested directory, using the same pattern syntax as the profile lists above. The matched directory and everything under it is skipped
 - `modOutputMode` — non-destructive output mode. Default: true
 - `modOutputName` — output mod folder name. Default: "ATAK"
@@ -204,13 +235,6 @@ Community profiles available in the `profiles/` directory in the repository:
 
 ---
 
-## Performance
-
-**Note on BC7:** BC7 GPU acceleration is not available on Linux — CPU-only, ~40-60 min for large jobs. Windows benefits from DirectX GPU acceleration. For faster Linux compression, keep all profiles at BC3 (the default).
-
-Benchmarks and feedback welcome — open a GitHub issue or post in the community Discord.
-
----
 
 ## Compression quality
 
@@ -224,15 +248,6 @@ For 4GB VRAM cards, set `"maxTextureSize": 1024` on Sky and Terrain profiles in 
 
 ---
 
-## Known limitations
-
-- BC7 GPU acceleration not available on Linux — CPU fallback, slow on large jobs
-- Cancelling a compression job deletes the in-progress file — originals untouched
-- 7-Zip backup progress is sparse on large solid archives — the archive is growing even when the progress bar appears stuck
-- If the app crashes during backup/restore on Linux, run `pkill 7zz` if you notice high CPU/RAM usage afterwards
-- Mod Output Mode without a valid modlist.txt will show 0 textures — check Settings if this happens
-
----
 
 ## Building from source
 
