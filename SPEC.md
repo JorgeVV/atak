@@ -22,40 +22,53 @@ startup, cleaned up on exit.
 internal/tools/bin/
 ├── texconv-linux                     # community Linux port of Microsoft's texconv
 ├── texconv-windows.exe               # official Microsoft build
-├── texconv-macos                     # matyalatte macOS universal binary (Intel + Apple Silicon)
+├── texconv-macos-amd64               # matyalatte macOS build, x86-64 slice
+├── texconv-macos-arm64               # matyalatte macOS build, ARM64 slice
 ├── compressonator-bc7e-linux         # AMD Compressonator fork with bc7e.ispc BC7 encoder (Linux)
 ├── compressonator-bc7e-windows.exe   # same fork, Windows build
-├── compressonator-bc7e-macos         # same fork, macOS universal binary (Intel + Apple Silicon)
+├── compressonator-bc7e-macos-amd64   # same fork, macOS x86-64 slice
+├── compressonator-bc7e-macos-arm64   # same fork, macOS ARM64 slice
 ├── 7zz                               # 7-Zip standalone Linux binary
 ├── 7za.exe                           # 7-Zip standalone Windows binary
-└── 7zz-macos                         # 7-Zip standalone macOS universal binary (Intel + Apple Silicon)
+├── 7zz-macos-amd64                   # 7-Zip standalone macOS x86-64 slice
+└── 7zz-macos-arm64                   # 7-Zip standalone macOS ARM64 slice
 ```
+
+The macOS tools are thin Mach-O files, not universal binaries. Upstream ships
+texconv-macos and 7zz-macos fat, and `build_flavor.sh batch universal` produces
+a fat compressonator; `lipo -thin` splits each one and the two halves are
+committed side by side. A darwin build then embeds only the slice it can run.
 
 All three platforms ship compressonator-bc7e. `Extract()` still writes the
 binary only when the embedded data is non-empty, and callers must check
 `EmbeddedTools.CompressonatorPath == ""` to decide availability rather than
-special-casing `runtime.GOOS` — that keeps a future platform without a build
-from needing changes anywhere but `embed_<platform>.go`.
+special-casing `runtime.GOOS`. That keeps a future platform without a build
+from needing changes anywhere but its own embed file.
 
 ### Building compressonator-bc7e for macOS
 
 AMD ships no macOS build, so the macOS binary is built from source with
 `tools/macos/build_flavor.sh` in the fork (`noisethanks/compressonator`,
-branch `bc7enc-rdo-integration`). One command reproduces the shipped artifact:
+branch `bc7enc-rdo-integration`). Two commands reproduce the shipped
+artifacts, one per architecture:
 
 ```sh
-compressonator/tools/macos/build_flavor.sh batch universal
+compressonator/tools/macos/build_flavor.sh batch arm64
+compressonator/tools/macos/build_flavor.sh batch x86_64
 ```
 
-That builds one slice per architecture, joins them with `lipo -create`, and
-ad-hoc signs the result with `--identifier compressonatorcli`, matching how
-texconv-macos and 7zz-macos ship. The script's own header documents the
-directory layout it expects and the four setup steps that precede it: clone
-bc7enc_rdo, apply bc7enc_rdo#29, unpack ISPC v1.31.0, and run
-`python3 build/fetch_dependencies.py`. That last one is not optional even for
-a CLI-only build, because `external/CMakeLists.txt` resolves glm and rapidxml
-for any build with `OPTION_BUILD_APPS_CMP_CLI` on, whatever the OpenGL and Qt
-flags are set to.
+Each run builds one slice and ad-hoc signs it with `--identifier
+compressonatorcli`. Nothing joins them afterwards, because atak embeds the two
+slices separately. Passing `universal` still works and still runs `lipo
+-create`; the two committed files came from one such run, split back apart with
+`lipo -thin`, which is why both carry a single build's ISPC timestamps.
+
+The script's own header documents the directory layout it expects and the four
+setup steps that precede it: clone bc7enc_rdo, apply bc7enc_rdo#29, unpack ISPC
+v1.31.0, and run `python3 build/fetch_dependencies.py`. That last one is not
+optional even for a CLI-only build, because `external/CMakeLists.txt` resolves
+glm and rapidxml for any build with `OPTION_BUILD_APPS_CMP_CLI` on, whatever
+the OpenGL and Qt flags are set to.
 
 **The ISPC host architecture decides whether the encoder is correct.** ISPC
 1.19 and later, when the *compiler itself* is an aarch64 build, silently
@@ -152,13 +165,17 @@ versus 24.70 s for the same three textures at `-Quality 1.0`. That ordering
 (same quality tier, far faster) is what the fork's own README reports, and it
 is the reason to choose this backend.
 
-macOS universal binaries contain both x86-64 and ARM64 slices — one binary covers
-all Mac hardware. No need to split darwin/amd64 and darwin/arm64 build tags.
+Linux and Windows have one `embed_<platform>.go` each. macOS has two,
+`embed_darwin_amd64.go` and `embed_darwin_arm64.go`, tagged `darwin && amd64`
+and `darwin && arm64`. All four files declare the same variable names
+(`texconvBin`, `sevenZipBin`, `compressonatorBin`) and the same name constants,
+so nothing outside this package knows the difference. See
+`internal/tools/embed_linux.go` for the canonical pattern.
 
-Each platform has its own `embed_<platform>.go` with `//go:build` tag and
-`//go:embed` directives. All three use the same variable names (`texconvBin`,
-`sevenZipBin`, `compressonatorBin`) so the rest of the codebase is
-platform-agnostic. See `internal/tools/embed_linux.go` for the canonical pattern.
+Splitting darwin per GOARCH costs one extra file and removes the dead slice
+that a per-GOOS embed would carry. It also removes the question of which slice
+a spawned universal tool picks: each build now holds exactly one, matching its
+own architecture.
 
 `EmbeddedTools` fields:
 - `TexconvPath` — always populated.
@@ -171,21 +188,20 @@ On startup:
 3. Store paths in an `EmbeddedTools` struct passed through the app
 4. `defer tools.Cleanup()` in main
 
-**Binary size:** compressonator-bc7e adds ~9MB on Linux, 6,690,032 bytes on
-macOS (two slices in one universal binary) and ~3.5MB on Windows. Current
-stripped (`-s -w`) sizes: darwin/arm64 24,161,442 bytes and darwin/amd64
-24,281,264 bytes, Linux ~20MB, Windows ~11MB — all under the historical 25MB
-target, with macOS the tightest at roughly 0.8MB of headroom. Watch this
-ceiling if further binaries land.
+**Binary size:** compressonator-bc7e adds ~9MB on Linux, 3,999,328 bytes on
+darwin/amd64, 2,659,568 bytes on darwin/arm64 and ~3.5MB on Windows. Current
+stripped (`-s -w`) sizes:
 
-Each macOS build carries a dead slice of every embedded tool, since the tools
-are embedded per GOOS while the release now ships per GOARCH. The three macOS
-tools total 18.24MiB, about half of which is unreachable in any one build.
-Splitting `embed_darwin.go` into `embed_darwin_amd64.go` and
-`embed_darwin_arm64.go` would recover roughly 9MiB and remove the `lipo
--create` step from the build recipe. Not done: the ceiling is not binding
-today, and it would need verifying that an x86-64 atak on Apple Silicon still
-spawns the tools it expects.
+| target | bytes | embedded tools |
+|---|---:|---:|
+| darwin/arm64 | 13,511,202 | 8.16MiB |
+| darwin/amd64 | 15,667,376 | 10.03MiB |
+| linux/amd64 | 21,368,992 | 15.48MiB |
+| windows/amd64 | 12,466,688 | 6.75MiB |
+
+Every embedded byte in those four builds is reachable. Linux is the tightest
+against the historical 25MB target, with roughly 3.5MB of headroom. Watch that
+ceiling if further binaries land.
 
 No other runtime dependencies. The binary must run on any supported platform
 without the user installing anything.
@@ -480,14 +496,15 @@ atak/
 ├── SPEC.md
 ├── profiles.json                        # repo-root copy of current default profile
 ├── bin/
-│   ├── texconv-linux / texconv-windows.exe / texconv-macos
-│   └── 7zz / 7zz.exe / 7zz-macos
+│   ├── texconv-linux / texconv-windows.exe / texconv-macos-{amd64,arm64}
+│   └── 7zz / 7zz.exe / 7zz-macos-{amd64,arm64}
 └── internal/
     ├── tools/
     │   ├── embed.go                     # EmbeddedTools struct, extraction, cleanup
     │   ├── embed_linux.go               # //go:embed bin/texconv-linux, bin/7zz
     │   ├── embed_windows.go             # //go:embed bin/texconv-windows.exe, bin/7zz.exe
-    │   ├── embed_darwin.go              # //go:embed bin/texconv-macos, bin/7zz-macos, bin/compressonator-bc7e-macos
+    │   ├── embed_darwin_amd64.go        # //go:embed the three *-macos-amd64 tools
+    │   ├── embed_darwin_arm64.go        # //go:embed the three *-macos-arm64 tools
     │   ├── process_linux.go             # setProcAttr / killProcess — Linux/macOS
     │   ├── process_windows.go           # setProcAttr / killProcess — Windows Job Objects
     │   ├── lockfile.go                  # stale-process lockfile (Linux)
@@ -1352,10 +1369,17 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
   -ldflags="-s -w -X main.version=v0.1.0" \
   -o atak-windows.exe ./main.go
 
-# Release — macOS (universal embedded tools, Go binary is amd64)
+# Release — macOS Apple Silicon. Each darwin build embeds its own tool slices,
+# so the two outputs are not interchangeable. goreleaser names both `atak-macos`
+# inside separate archives; build them to distinct paths by hand.
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+  -ldflags="-s -w -X main.version=v0.1.0" \
+  -o atak-macos-arm64 ./main.go
+
+# Release — macOS Intel
 CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
   -ldflags="-s -w -X main.version=v0.1.0" \
-  -o atak-macos ./main.go
+  -o atak-macos-amd64 ./main.go
 
 # goreleaser handles all targets in CI — version injected from git tag
 ```
@@ -1370,23 +1394,24 @@ builds without the flag, version displays as `dev`.
 - `darwin/amd64` — macOS on Intel, community-tested
 - `darwin/arm64` — macOS on Apple Silicon, native
 
-Note: macOS ships two archives, not one universal binary. The Go binary is
-architecture-specific while the embedded tools are universal, so a universal
-atak would carry two full copies of the tools — about 45MB against a 25MB
-target. Two 22MB archives stay under it.
+Note: macOS ships two archives, not one universal binary. Both archives use the
+binary name `atak-macos`; the archive name carries the architecture. A universal
+atak would need both Go binaries and both sets of tools, near 29MB against a
+25MB target, so the split archives are also the smaller answer.
 
-The architecture of the atak process decides the architecture of every tool it
-spawns: a universal child inherits the parent's slice, so an `atak-macos` built
-for arm64 runs texconv, 7zz and compressonator-bc7e natively, and an x86-64
-build runs all three under Rosetta 2. That is why `darwin/arm64` is a release
-target rather than an optional extra — before it existed, every release user on
-Apple Silicon was translated end to end.
+Each darwin build embeds the tool slices for its own architecture and nothing
+else. An arm64 `atak-macos` extracts arm64 texconv, 7zz and compressonator-bc7e
+and runs them natively. An x86-64 build extracts x86-64 copies and runs them
+under Rosetta 2, the same translation the parent process is already under. No
+mixed-architecture process tree is possible, because no embedded tool has a
+second slice to fall back to. `darwin/arm64` is a release target rather than an
+optional extra for that reason. Without it, every release user on Apple Silicon
+runs translated end to end.
 
 The `-s -w` flags strip debug info. Final binaries should be under 25MB including
-all embedded tools. With compressonator-bc7e on all three platforms, stripped
-release sizes are roughly macOS ~22MB, Linux ~20MB, Windows ~11MB — still under
-the ceiling, with macOS the tightest since its universal tools carry two slices
-each. Track this if further binaries land.
+all embedded tools. Stripped release sizes are 12.9MiB for darwin/arm64, 14.9MiB
+for darwin/amd64, 20.4MiB for Linux and 11.9MiB for Windows. Linux is the
+tightest of the four. Track this if further binaries land.
 
 ## Cross-Platform Rules
 

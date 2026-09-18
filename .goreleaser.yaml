@@ -35,9 +35,9 @@ builds:
     binary: atak-macos
 
   # Apple Silicon gets its own artifact rather than a universal binary.
-  # A universal atak would carry two full copies of the embedded tools,
-  # ~45MB against the 25MB target, because the tools are embedded per GOOS
-  # and each already holds both slices.
+  # Each darwin build embeds only the tool slices for its own GOARCH, so a
+  # universal atak would still need both Go binaries and both tool sets,
+  # ~29MB against the 25MB target.
   - id: macos-arm64
     goos: [darwin]
     goarch: [arm64]
