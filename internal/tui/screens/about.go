@@ -260,7 +260,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 7-Zip
 ------
 GNU Lesser General Public License v2.1
-Copyright (C) 1999-2023 Igor Pavlov
+Copyright (C) 1999-2026 Igor Pavlov
 https://www.7-zip.org
 
 7-Zip is free software. You can use 7-Zip on any computer, including a
