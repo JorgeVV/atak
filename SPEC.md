@@ -332,7 +332,9 @@ See `profiles.json` at the repo root for current defaults, and
 - `maxTextureSize` — optional integer, default 0 (no limit). When set, caps
   the output texture's maximum dimension while preserving aspect ratio.
   Only applied when at least one dimension exceeds the limit — textures
-  smaller than maxTextureSize are never upscaled.
+  smaller than maxTextureSize are never scaled up to it. Block alignment is a
+  separate rule and can still round a dimension up by as much as 3 pixels; see
+  Block alignment below.
 
   Implementation: texconv's `-w` and `-h` flags set **exact** pixel dimensions,
   not maximums — passing one without the other would distort non-square
@@ -499,6 +501,7 @@ atak/
     │   ├── parser.go                    # parseModList() — reads MO2 modlist.txt
     │   └── virtual.go                   # buildVirtualFS() — assembles virtual filesystem map
     ├── compress/
+    │   ├── align.go                     # planResize(): maxTextureSize + BCn block alignment
     │   ├── backend.go                   # Backend interface, dispatch() + fallback routing
     │   ├── texconv.go                   # TexconvBackend — arg builder, BC7 fallback
     │   ├── compressonator.go            # CompressonatorBackend — CPU-forced arg builder
@@ -920,15 +923,63 @@ assets are filtered to the chosen mod before passing to the worker pool.
   `Backend: compressonator-bc7e (CPU)` vs. `Backend: texconv (GPU for BC7)`)
   so mid-run timing expectations are legible.
 
-- **maxTextureSize fallback (compressonator → texconv).** compressonator-bc7e's
-  CLI exposes mip controls but no exact-size resize flag (no `-w`/`-h`
-  equivalent). Rather than silently ignore `maxTextureSize`, `dispatch()` in
-  `internal/compress/backend.go` routes any file that needs resizing through a
-  texconv fallback backend for that file only. Mirrors the existing texconv
-  BC7 → BC3 fallback philosophy — automatic, transparent, recorded. The
-  backend that actually processed each file is captured in the new
-  `CompressionResult.Backend` field so the summary and error UI can attribute
-  mismatches correctly.
+- **Resize fallback (compressonator → texconv).** compressonator-bc7e's CLI
+  exposes mip controls but no exact-size resize flag (no `-w`/`-h` equivalent).
+  Rather than silently ignore the target size, `dispatch()` in
+  `internal/compress/backend.go` involves texconv for any file that needs one.
+  Two rules put a file there: the `maxTextureSize` budget, and block alignment
+  (below). Mirrors the existing texconv BC7 → BC3 fallback philosophy —
+  automatic, transparent, recorded.
+
+  `dispatch()` tries the cheap split first. `resampleThenPrimary` has texconv
+  write an uncompressed `R8G8B8A8_UNORM` copy at the exact target size into a
+  temporary directory, then hands that file to the configured encoder. Only if
+  the resize or the encode fails does texconv take the whole job.
+
+  The split exists for speed. DirectXTex's BC7 codec is scalar and single
+  threaded while `bc7e.ispc` is SIMD and multithreaded: on a 658x493 UI icon,
+  texconv encoding BC7 itself costs 27.9 s against 0.09 s for the split. Over
+  one GAMMA modlist's 332 misaligned sources that is 31 s against several hours.
+  The whole-job path stays as the safety net, because a failed resize must never
+  turn a file that would otherwise have compressed into a failure.
+
+  `CompressionResult.Backend` names the backend that **encoded** the file, which
+  is the primary on the split path. `Asset` and `Before` are restored to the
+  original file afterwards, so the results screen never shows a temporary path
+  and the saved-bytes total stays correct.
+
+- **Block alignment (BCn dimensions rounded to a multiple of 4).** Every BCn
+  format encodes 4x4 pixel blocks, so a texture whose width or height is not a
+  multiple of 4 has no exact block-compressed representation. `d3dx11_43.dll`
+  resolves that at load time by rounding the dimensions up, and X-Ray loads every
+  texture through `D3DX11CreateTextureFromMemory`. The rounding forces a
+  resample, and resampling a block-compressed image forces a full decode, resize,
+  and re-encode through Microsoft's 2010 reference encoder, single threaded, on
+  first bind. For BC7 that costs seconds to minutes per texture: measured in a
+  live Wine prefix, a 43x43 icon cost 345 ms, 269x271 cost 10.8 s, and 1026x770
+  cost 287 s, while aligned files cost under 3 ms. The symptom is the game
+  freezing when a UI window opens.
+
+  Uncompressed sources have no block constraint, which is why this only appears
+  after compression. A RAW32 UI texture at 269x271 loads instantly; the same
+  image as BC7 does not. UI art is authored at arbitrary sizes while world art is
+  power-of-two, so misalignment collects under `textures/ui/`.
+
+  `planResize` in `internal/compress/align.go` therefore rounds a
+  block-compressed target up to the next multiple of 4 at encode time. This is
+  not new behavior — it is the resize the engine already performs on every load,
+  moved offline, paid once, with a cubic filter instead of the loader's. It
+  rounds **down** instead when rounding up would exceed `maxTextureSize`, so
+  honoring alignment never breaks the VRAM budget, and one block is the floor.
+  Formats that are not block compressed are never resized for alignment.
+
+  `planResize` is the single source of truth for output dimensions: `dispatch()`
+  calls it to decide whether compressonator can take a job at all, and texconv's
+  `Run` calls it to build `-w`/`-h`, so the two cannot drift apart. Affected
+  files are reported under `FallbackBlockAlign`. Coverage:
+  `internal/compress/align_test.go` (planner and routing),
+  `align_e2e_test.go` (real binaries, header and payload assertions), and
+  `align_corpus_test.go` (opt-in via `ATAK_CORPUS`, walks a real mod tree).
 
 - **DDS-reader gap fallback (compressonator → texconv, narrow match).**
   compressonator-bc7e's DDS loader rejects some subvariants DirectXTex handles
@@ -976,8 +1027,9 @@ assets are filtered to the chosen mod before passing to the worker pool.
   `-if CUBIC` cubic interpolation for mip generation (better quality)
   `-gpu 0` GPU accelerated compression (DirectX GPU on Windows, CPU fallback on Linux)
   `-nologo` suppress Microsoft header output
-  `-w <W> -h <H>` only added when `maxTextureSize > 0` — both dimensions computed
-  explicitly to preserve aspect ratio (see `maxTextureSize` field above)
+  `-w <W> -h <H>` only added when `planResize` returns a target — both dimensions
+  computed explicitly to preserve aspect ratio and to land on a multiple of 4 for
+  block-compressed formats (see `maxTextureSize` and Block alignment above)
 
   Note: `-bc x` (quick BC7 encoder) intentionally removed. The exhaustive BC7
   encoder produces significantly better quality on metallic and reflective surfaces
