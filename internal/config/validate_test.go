@@ -7,6 +7,24 @@ import (
 	"testing"
 )
 
+// redirectConfigDir points os.UserConfigDir() at a fresh temp directory and
+// returns the atak config dir inside it. Setting XDG_CONFIG_HOME alone is not
+// enough: os.UserConfigDir reads it on Linux, but uses $HOME/Library/Application
+// Support on darwin and %AppData% on Windows, so a test that sets only the one
+// variable silently reads the developer's real config.json.
+func redirectConfigDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+	t.Setenv("AppData", filepath.Join(dir, "AppData"))
+	base, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("os.UserConfigDir: %v", err)
+	}
+	return filepath.Join(base, "atak")
+}
+
 func TestValidateConfig(t *testing.T) {
 	base := `"workerCount":1,"backupLevel":6,"modOutputMode":false,"modOutputName":"ATAK","stripMipsWhenDisabled":false,"modsDir":"","backupDir":"","modlistPath":""`
 
@@ -85,14 +103,13 @@ func TestValidateConfig(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
-			dir := t.TempDir()
-			cfgDir := filepath.Join(dir, "atak")
-			os.MkdirAll(cfgDir, 0755)
-			os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(tc.json), 0644)
-
-			orig := os.Getenv("XDG_CONFIG_HOME")
-			os.Setenv("XDG_CONFIG_HOME", dir)
-			t.Cleanup(func() { os.Setenv("XDG_CONFIG_HOME", orig) })
+			cfgDir := redirectConfigDir(t)
+			if err := os.MkdirAll(cfgDir, 0755); err != nil {
+				t.Fatalf("mkdir %s: %v", cfgDir, err)
+			}
+			if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(tc.json), 0644); err != nil {
+				t.Fatalf("write config.json: %v", err)
+			}
 
 			_, err := Load()
 
@@ -115,10 +132,7 @@ func TestValidateConfig(t *testing.T) {
 
 func TestLoadFirstRunNoValidation(t *testing.T) {
 	// First run (no config.json) must not trigger validation and must return defaults.
-	dir := t.TempDir()
-	orig := os.Getenv("XDG_CONFIG_HOME")
-	os.Setenv("XDG_CONFIG_HOME", dir)
-	defer os.Setenv("XDG_CONFIG_HOME", orig)
+	redirectConfigDir(t)
 
 	cfg, err := Load()
 	if err != nil {

@@ -1,8 +1,8 @@
 package config
 
 import (
-	"encoding/json"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -52,20 +52,17 @@ type Config struct {
 	WorkerCount int `json:"workerCount"`
 	BackupLevel int `json:"backupLevel"`
 	// CompressionBackend selects which embedded compressor runs. Valid values:
-	// "texconv" (default, all platforms) and "compressonator-bc7e" (Linux/Windows
-	// only). On darwin the resolved value is always coerced back to "texconv" on
-	// load, so a config synced from another OS can't select an unavailable backend.
-	// This coercion is expected to be removed once macOS gains compressonator-bc7e
-	// support; validateConfig needs no changes at that point.
+	// "texconv" and "compressonator-bc7e", both available on every supported
+	// platform. An unrecognized value is coerced back to "texconv" on load.
 	CompressionBackend string `json:"compressionBackend"`
 	// ScanExclusions are directory globs pruned during the scan. A plain name matches
 	// a directory (or mod) anywhere; a path pattern like */textures/ui/SquareDOV
 	// matches a nested directory, sharing the profiles.json pattern syntax. A matched
 	// directory and its whole subtree are skipped. An empty array ([]) is valid.
-	ScanExclusions        []string `json:"scanExclusions"`
-	ModOutputMode         bool     `json:"modOutputMode"`
-	ModOutputName         string   `json:"modOutputName"`
-	ModlistPath           string   `json:"modlistPath"`
+	ScanExclusions []string `json:"scanExclusions"`
+	ModOutputMode  bool     `json:"modOutputMode"`
+	ModOutputName  string   `json:"modOutputName"`
+	ModlistPath    string   `json:"modlistPath"`
 	// StripMipsWhenDisabled makes a profile's generateMips:false authoritative: source
 	// mip chains are dropped instead of preserved. Off by default, where the source's
 	// own mip count decides for generateMips:false profiles (see compress.ShouldGenerateMips).
@@ -160,8 +157,9 @@ func validateConfig(data []byte) error {
 	}
 
 	// compressionBackend: must be present, must be a string, and must be exactly one
-	// of the two valid backend identifiers. Applies uniformly on all platforms —
-	// the darwin coercion in normalizeBackend is a separate post-load step.
+	// of the two valid backend identifiers. Every supported platform ships both, so
+	// this check is uniform; normalizeBackend is a separate post-load step that only
+	// guards against an unknown value.
 	backendRaw, ok := raw["compressionBackend"]
 	if !ok {
 		return fmt.Errorf("config.json: field %q is missing", "compressionBackend")
@@ -200,15 +198,11 @@ func jsonKind(v json.RawMessage) string {
 	}
 }
 
-// normalizeBackend coerces a backend value to one available on the current platform.
-// On darwin, always returns BackendTexconv regardless of the stored value, so a config
-// synced from another OS can't select an unavailable backend. This darwin branch is
-// expected to be removed once macOS gains compressonator-bc7e support; validateConfig
-// needs no changes at that point.
+// normalizeBackend validates a persisted backend selection and coerces unknown
+// values back to the default. Called on every Load so a hand-edited or
+// future-dated config.json can never name a backend this build has no
+// implementation for.
 func normalizeBackend(v string) string {
-	if runtime.GOOS == "darwin" {
-		return BackendTexconv
-	}
 	switch v {
 	case BackendTexconv, BackendCompressonatorBc7e:
 		return v

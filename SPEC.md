@@ -22,33 +22,173 @@ startup, cleaned up on exit.
 internal/tools/bin/
 ├── texconv-linux                     # community Linux port of Microsoft's texconv
 ├── texconv-windows.exe               # official Microsoft build
-├── texconv-macos                     # matyalatte macOS universal binary (Intel + Apple Silicon)
+├── texconv-macos-amd64               # matyalatte macOS build, x86-64 slice
+├── texconv-macos-arm64               # matyalatte macOS build, ARM64 slice
 ├── compressonator-bc7e-linux         # AMD Compressonator fork with bc7e.ispc BC7 encoder (Linux)
 ├── compressonator-bc7e-windows.exe   # same fork, Windows build
+├── compressonator-bc7e-macos-amd64   # same fork, macOS x86-64 slice
+├── compressonator-bc7e-macos-arm64   # same fork, macOS ARM64 slice
 ├── 7zz                               # 7-Zip standalone Linux binary
 ├── 7za.exe                           # 7-Zip standalone Windows binary
-└── 7zz-macos                         # 7-Zip standalone macOS universal binary (Intel + Apple Silicon)
+├── 7zz-macos-amd64                   # 7-Zip standalone macOS x86-64 slice
+└── 7zz-macos-arm64                   # 7-Zip standalone macOS ARM64 slice
 ```
 
-**macOS excludes compressonator-bc7e** — the upstream fork is Linux/Windows only
-(GPU codec paths removed, tested on GCC and MSVC; darwin is out of scope per the
-fork's own README §8). `embed_darwin.go` declares `compressonatorBin` as an
-empty byte slice and `compressonatorName` as `""`, and `Extract()` skips the
-write when the data is empty. Callers must check `EmbeddedTools.CompressonatorPath == ""`
-to know the backend is unavailable rather than special-casing `runtime.GOOS`.
+The macOS tools are thin Mach-O files, not universal binaries. Upstream ships
+texconv-macos and 7zz-macos fat, so `lipo -thin` splits each into the two
+committed halves. compressonator-bc7e is built here and builds one slice per
+run, so it needs no splitting. A darwin build embeds only the slice it can
+run.
 
-macOS universal binaries contain both x86-64 and ARM64 slices — one binary covers
-all Mac hardware. No need to split darwin/amd64 and darwin/arm64 build tags.
+All three platforms ship compressonator-bc7e. `Extract()` still writes the
+binary only when the embedded data is non-empty, and callers must check
+`EmbeddedTools.CompressonatorPath == ""` to decide availability rather than
+special-casing `runtime.GOOS`. That keeps a future platform without a build
+from needing changes anywhere but its own embed file.
 
-Each platform has its own `embed_<platform>.go` with `//go:build` tag and
-`//go:embed` directives. All three use the same variable names (`texconvBin`,
-`sevenZipBin`, `compressonatorBin`) so the rest of the codebase is
-platform-agnostic. See `internal/tools/embed_linux.go` for the canonical pattern.
+### Building compressonator-bc7e for macOS
+
+AMD ships no macOS build, so the macOS binary is built from source with
+`tools/macos/build_flavor.sh` in the fork (`noisethanks/compressonator`,
+branch `bc7enc-rdo-integration`). Two commands reproduce the shipped
+artifacts, one per architecture:
+
+```sh
+B=internal/tools/bin/compressonator-bc7e-macos
+OUTPUT=$B-arm64 compressonator/tools/macos/build_flavor.sh batch arm64
+OUTPUT=$B-amd64 compressonator/tools/macos/build_flavor.sh batch x86_64
+```
+
+Each run builds one slice, ad-hoc signs it with `--identifier
+compressonatorcli`, and writes it where `OUTPUT=` points. Nothing joins them
+afterwards, because atak embeds the two slices separately. The file names end
+in amd64 because Go names that architecture amd64; the Mach-O slice inside is
+x86_64.
+
+The two committed files came from one `batch universal` run split with `lipo
+-thin`, so both carry the same build's ISPC timestamps. The two commands above
+reproduce them to within those timestamps, the `LC_UUID` derived from them, and
+the signature page hashes covering both: 82 differing bytes of 2,659,568 on
+arm64 and 152 of 3,999,328 on x86_64, with byte-identical encoder output.
+
+The script's own header documents the directory layout it expects and the four
+setup steps that precede it: clone bc7enc_rdo, apply bc7enc_rdo#29, unpack ISPC
+v1.31.0, and run `python3 build/fetch_dependencies.py`. That last one is not
+optional even for a CLI-only build, because `external/CMakeLists.txt` resolves
+glm and rapidxml for any build with `OPTION_BUILD_APPS_CMP_CLI` on, whatever
+the OpenGL and Qt flags are set to.
+
+**The ISPC host architecture decides whether the encoder is correct.** ISPC
+1.19 and later, when the *compiler itself* is an aarch64 build, silently
+miscompiles `--` on a varying unsigned int into a no-op
+([ispc#3882](https://github.com/ispc/ispc/issues/3882)), which corrupts bc7e's
+block bit-packing
+([bc7enc_rdo#23](https://github.com/richgel999/bc7enc_rdo/issues/23)). The
+damage is not limited to arm64 output — an arm64 ISPC host emits a broken
+encoder for the x86_64 target too. Compiled with assertions the failure is
+loud (`bc7e.ispc:2890: Assertion failed: *pCur_ofs <= 128`); the release build
+passes `--opt=disable-assertions`, so it would instead ship textures that are
+quietly ~25 dB PSNR worse.
+
+Two independent routes avoid it, and `build_flavor.sh` accepts either:
+
+1. **Apply [bc7enc_rdo#29](https://github.com/richgel999/bc7enc_rdo/pull/29)**,
+   which rewrites the five affected `x--` sites as `x -= 1`. Any ISPC host
+   then compiles bc7e correctly. Verified byte-identical to an unpatched
+   build made with an x86_64 host, on both targets.
+2. **Use the macOS x86_64 ISPC package**, which runs under Rosetta 2 on Apple
+   Silicon.
+
+Route 1 alone is enough, and it is the simpler recipe. Whether an ISPC can
+emit a given architecture depends on the LLVM it was built against, not on its
+own Mach-O slice: the official `ispc-v1.31.0-macOS.arm64` package cross-compiles
+the x86_64 slice, so Apple Silicon needs neither Rosetta 2 nor the larger
+universal package. Homebrew's `ispc` is the exception, because it links
+`llvm@22` and rejects `--arch=x86-64` outright; the script compiles a throwaway
+kernel per requested slice to catch that in the first second.
+
+Rather than infer the defect from the host architecture, the script compiles a
+six-line kernel that exercises `x--` on a varying unsigned int and checks the
+result, in about 0.1 s. It refuses only the combination that measurement shows
+is unsafe: a compiler that demonstrably drops the decrement, against a
+bc7e.ispc that still uses it. ISPC 1.31.0 miscompiles it on any aarch64 host,
+the official package included, so PR #29 is required in practice on Apple
+Silicon. The shipped binary was built with PR #29 applied and an
+`ispc-v1.31.0-macOS.arm64` host.
+
+Other fixes carried in the fork, all upstream defects rather than fork changes.
+The first four are macOS-specific; the threading one is not:
+- The C++ standard probe skipped Apple hosts and left them on C++11, which
+  disables the `std::filesystem` path in `cmp_fileio.cpp`. `CMP_GetJustFileExt`
+  then returns `dds` instead of `.dds`, `IsDestinationUnCompressed()` compares
+  against `".dds"` and answers true for every destination, and the CLI writes
+  a **decompressed** DDS while reporting success. Apple now takes the C++17
+  branch.
+- `CMP_Core_SSE` / `_AVX` / `_AVX512` are x86 intrinsic code compiled with
+  `-march=nehalem|haswell|skylake-avx512`; they are skipped on non-x86 targets,
+  with the declarations and the BC1 dispatch gated on `CMP_CORE_X86_SIMD`.
+- `GetCPUID` was a no-op outside Windows but left its output buffer
+  uninitialized, so macOS chose BC1 SIMD kernels from stack garbage. It now
+  zero-fills, which also keeps macOS on the same scalar kernels the Linux
+  reference build uses.
+- The CLI's Apple link list hardcoded `/usr/lib/libz.dylib` and five
+  `/usr/local/lib/libIlm*`-era OpenEXR paths. macOS has had no on-disk
+  `/usr/lib/libz.dylib` since Big Sur, so the link failed outright.
+- **The BC7 worker pool handed slots between threads through a
+  `volatile CMP_BOOL run` flag.** `volatile` orders nothing between threads.
+  On arm64 the producer could see a slot go idle before the worker's writes
+  to the output buffer were visible, then reuse the slot and overwrite the
+  input the worker was still reading. Measured on Apple Silicon before the
+  fix: stock BC7 produced **10 different outputs from 10 identical runs**,
+  the bc7e batched path 3 to 6 distinct outputs from 10, one run lost 19 dB
+  of PSNR, and one run segfaulted. The flag is now `std::atomic<bool>` with
+  release stores and acquire loads on both sides of the handoff, after which
+  every configuration returns a single result across 12 runs and matches the
+  `-NumThreads 1` reference exactly. x86-64's store ordering hides this bug
+  entirely, which is why the Linux and Windows builds never showed it — it is
+  an upstream defect in stock Compressonator, not something the bc7e work
+  introduced, and it affects the stock BC7 codec on any weakly ordered CPU.
+
+**Cross-platform output is no longer bit-identical.** The arm64 slice encodes
+through bc7e's NEON target and the scalar BC1/BC3/BC4/BC5 kernels compiled for
+arm64; both differ in the low bits from the SSE/AVX build. Measured on a mixed
+corpus, 18 of 38 format/mip configurations differ byte-wise between the two
+macOS slices, while PSNR tracks to within ±0.1 dB. Output is reproducible for
+a given binary: the same input gives the same bytes on every run.
+
+The binary itself is deterministic in its code but not bit-reproducible. Two
+builds from identical sources on one machine differ only in a 4-byte Unix
+timestamp per compiled ISPC target (four in the x86_64 slice, one in arm64)
+and in the `LC_UUID` computed downstream of it. Encoder output across those
+two builds is byte-identical. Change the toolchain, however, and the encoder
+moves: rebuilding under a newer Xcode differs from the previously shipped
+binary in 12 of 241,584 pixels on a 719x336 test image, at 57.227 dB either
+way. A golden output hash would therefore track the toolchain rather than
+correctness, which is why the checks live in `build_flavor.sh` as assertions
+on linkage, architecture and deployment target instead.
+
+Against the stock codec on the same machine, bc7e matches on quality and wins
+decisively on time — within ±0.7 dB either way across the corpus, and 0.54 s
+versus 24.70 s for the same three textures at `-Quality 1.0`. That ordering
+(same quality tier, far faster) is what the fork's own README reports, and it
+is the reason to choose this backend.
+
+Linux and Windows have one `embed_<platform>.go` each. macOS has two,
+`embed_darwin_amd64.go` and `embed_darwin_arm64.go`, tagged `darwin && amd64`
+and `darwin && arm64`. All four files declare the same variable names
+(`texconvBin`, `sevenZipBin`, `compressonatorBin`) and the same name constants,
+so nothing outside this package knows the difference. See
+`internal/tools/embed_linux.go` for the canonical pattern.
+
+Splitting darwin per GOARCH costs one extra file and removes the dead slice
+that a per-GOOS embed would carry. It also removes the question of which slice
+a spawned universal tool picks: each build now holds exactly one, matching its
+own architecture.
 
 `EmbeddedTools` fields:
 - `TexconvPath` — always populated.
 - `SevenZipPath` — always populated.
-- `CompressonatorPath` — populated on Linux/Windows; empty string on darwin.
+- `CompressonatorPath` — populated on every platform that embeds a build; empty string when none is embedded.
 
 On startup:
 1. Extract every non-empty embedded binary to `os.MkdirTemp`
@@ -58,7 +198,9 @@ On startup:
 3. Store paths in an `EmbeddedTools` struct passed through the app
 4. `defer tools.Cleanup()` in main
 
-See Build, below, for current stripped binary sizes and the 25MB ceiling.
+compressonator-bc7e adds ~9MB on Linux, 3,999,328 bytes on darwin/amd64,
+2,659,568 bytes on darwin/arm64 and ~3.5MB on Windows. See Build, below, for
+current stripped binary sizes and the 25MB ceiling.
 
 No other runtime dependencies. The binary must run on any supported platform
 without the user installing anything.
@@ -333,13 +475,15 @@ atak/
 └── internal/
     ├── tools/
     │   ├── bin/
-    │   │   ├── texconv-linux / texconv-windows.exe / texconv-macos
+    │   │   ├── texconv-linux / texconv-windows.exe / texconv-macos-{amd64,arm64}
     │   │   ├── compressonator-bc7e-linux / compressonator-bc7e-windows.exe
-    │   │   └── 7zz / 7za.exe / 7zz-macos
+    │   │   ├── compressonator-bc7e-macos-{amd64,arm64}
+    │   │   └── 7zz / 7za.exe / 7zz-macos-{amd64,arm64}
     │   ├── embed.go                     # EmbeddedTools struct, extraction, cleanup
     │   ├── embed_linux.go               # //go:embed texconv-linux, 7zz, compressonator-bc7e-linux
     │   ├── embed_windows.go             # //go:embed texconv-windows.exe, 7za.exe, compressonator-bc7e-windows.exe
-    │   ├── embed_darwin.go              # //go:embed texconv-macos, 7zz-macos; compressonatorBin empty
+    │   ├── embed_darwin_amd64.go        # //go:embed the three *-macos-amd64 tools
+    │   ├── embed_darwin_arm64.go        # //go:embed the three *-macos-arm64 tools
     │   ├── process_linux.go             # setProcAttr / killProcess — Linux/macOS
     │   ├── process_windows.go           # setProcAttr / killProcess — Windows Job Objects
     │   ├── lockfile.go                  # stale-process lockfile (Linux)
@@ -754,22 +898,24 @@ assets are filtered to the chosen mod before passing to the worker pool.
   - `CompressonatorBackend` — invokes the embedded compressonator-bc7e CLI
     (`internal/compress/compressonator.go`). AMD Compressonator fork with the
     CPU-side BC7 codec replaced by `bc7e.ispc` from richgel999/bc7enc_rdo;
-    GPU codec paths compiled out of the fork.
+    GPU codec paths compiled out of the fork. Available on all three
+    platforms.
 
   `worker.RunPool` selects the primary backend once per run from
   `config.CompressionBackend` and passes it plus an optional fallback into each
   worker goroutine. No per-file backend switching except the explicit
   `maxTextureSize` fallback below.
 
-- **compressonator-bc7e is always CPU, on both platforms.** The fork ships with
+- **compressonator-bc7e is always CPU, on every platform.** The fork ships with
   its GPU codec paths compiled out — the GPU path isn't guaranteed to work and
   is never attempted. `compressonatorArgs` **hardcodes `-EncodeWith CPU` on
   every invocation** rather than relying on the binary's default, so a future
   upstream change to the default can't quietly re-enable a broken GPU path.
   This is not user-configurable. It also means Windows users choosing this
   backend give up texconv's DirectX BC7 acceleration on purpose — the tradeoff
-  buys cross-platform bit-identical output and the fork's fixed BC7 p-bit
-  correctness. The active backend name and its CPU/GPU character are surfaced
+  buys the fork's fixed BC7 p-bit correctness on every platform. Output is
+  bit-identical between the x86-64 builds; the macOS arm64 slice matches on
+  quality but not byte-for-byte (see Embedded Binaries). The active backend name and its CPU/GPU character are surfaced
   in the compress `OperationScreen` title (e.g.
   `Backend: compressonator-bc7e (CPU)` vs. `Backend: texconv (GPU for BC7)`)
   so mid-run timing expectations are legible.
@@ -958,10 +1104,10 @@ All platforms expose the same interface: `SetProcAttr(cmd)`, `KillProcess(cmd)`,
   for flares/reticles. Never affects `generateMips:true`. Settings screen label:
   "Strip Mips When Disabled". Resolved in `compress.ShouldGenerateMips`.
 - **Compression backend** (`compressionBackend`) — `"texconv"` (default) or
-  `"compressonator-bc7e"` (Linux/Windows only). Row is hidden entirely on
-  darwin. Toggle with `space` / `←` / `→` — two-way selector, not free text.
-  Validation rules and the darwin coercion are documented once, under
-  config.json field groups below — not repeated here.
+  `"compressonator-bc7e"` (CPU-only). Available on all three platforms, so the
+  row is always shown. Toggle with `space` / `←` / `→` — two-way selector, not
+  free text. Validation rules are documented once, under config.json field
+  groups below — not repeated here.
 - Persist to `os.UserConfigDir()/atak/config.json`
 
 **Settings screen scroll support.** The Settings body can exceed the terminal height.
@@ -1067,7 +1213,7 @@ project URL, and a scrollable section with all third-party licenses:
 1. texconv (Texconv-Custom-DLL) — MIT
 2. 7-Zip — LGPL v2.1
 3. Charmbracelet UI dependencies (bubbletea, bubbles, lipgloss) — MIT
-4. **compressonator-bc7e** (optional Windows/Linux backend) — **dual-licensed:
+4. **compressonator-bc7e** (optional backend, all platforms) — **dual-licensed:
    AMD Compressonator MIT + `bc7e.ispc` Apache License 2.0**. The Apache 2.0
    grant requires the release to identify the incorporated Apache-2.0
    component, and the About screen carries that attribution verbatim
@@ -1253,10 +1399,17 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
   -ldflags="-s -w -X main.version=v0.1.0" \
   -o atak-windows.exe ./main.go
 
-# Release — macOS (universal embedded tools, Go binary is amd64)
+# Release — macOS Apple Silicon. Each darwin build embeds its own tool slices,
+# so the two outputs are not interchangeable. goreleaser names both `atak-macos`
+# inside separate archives; build them to distinct paths by hand.
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+  -ldflags="-s -w -X main.version=v0.1.0" \
+  -o atak-macos-arm64 ./main.go
+
+# Release — macOS Intel
 CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
   -ldflags="-s -w -X main.version=v0.1.0" \
-  -o atak-macos ./main.go
+  -o atak-macos-amd64 ./main.go
 
 # goreleaser handles all targets in CI — version injected from git tag
 ```
@@ -1268,17 +1421,35 @@ builds without the flag, version displays as `dev`.
 
 - `linux/amd64` — primary, tested by maintainer
 - `windows/amd64` — supported, community-tested
-- `darwin/amd64` — macOS universal binary (Intel + Apple Silicon), community-tested
+- `darwin/amd64` — macOS on Intel, community-tested
+- `darwin/arm64` — macOS on Apple Silicon, native
 
-Note: goreleaser only needs one darwin target since the embedded binaries are
-universal. The Go binary itself is architecture-specific but the embedded tools
-work on both Intel and Apple Silicon.
+Note: macOS ships two archives, not one universal binary. Both archives use the
+binary name `atak-macos`; the archive name carries the architecture. A universal
+atak would need both Go binaries and both sets of tools, near 29MB against a
+25MB target, so the split archives are also the smaller answer.
 
-The `-s -w` flags strip debug info. Final binaries should be under 25MB including
-all embedded tools. As of the compressonator-bc7e addition, stripped release
-sizes are roughly Linux ~21MB, Windows ~12MB, macOS ~17MB — still comfortably
-under the ceiling, with Linux the tightest since it embeds compressonator-bc7e
-(~9MB) alongside texconv + 7zz. Track this if further binaries land.
+Each darwin build embeds the tool slices for its own architecture and nothing
+else. An arm64 `atak-macos` extracts arm64 texconv, 7zz and compressonator-bc7e
+and runs them natively. An x86-64 build extracts x86-64 copies and runs them
+under Rosetta 2, the same translation the parent process is already under. No
+mixed-architecture process tree is possible, because no embedded tool has a
+second slice to fall back to. `darwin/arm64` is a release target rather than an
+optional extra for that reason. Without it, every release user on Apple Silicon
+runs translated end to end.
+
+The `-s -w` flags strip debug info. Final binaries should be under 25MB
+including all embedded tools:
+
+| target | bytes | embedded tools |
+|---|---:|---:|
+| darwin/arm64 | 13,495,106 | 8.16MiB |
+| darwin/amd64 | 15,667,792 | 10.03MiB |
+| linux/amd64 | 21,364,896 | 15.48MiB |
+| windows/amd64 | 12,466,688 | 6.75MiB |
+
+Every embedded byte in those four builds is reachable. Linux is the tightest,
+with roughly 3.6MB of headroom. Track this if further binaries land.
 
 ## Cross-Platform Rules
 
@@ -1297,12 +1468,11 @@ These must be followed in every file or platform support silently breaks:
 - **macOS process management:** Same as Linux — `syscall.SysProcAttr{Setpgid: true}`
   and `syscall.Kill(-pid, syscall.SIGKILL)` work on Darwin. `process_linux.go`
   build tag should be `//go:build linux || darwin`.
-- **compressonator-bc7e is Windows/Linux only.** The upstream fork is not built
-  for darwin (§8 of the fork's README: "macOS: out of scope"). `embed_darwin.go`
-  declares `compressonatorBin` as an empty byte slice and `compressonatorName`
-  as `""`, `Extract()` skips writing it, and `config.normalizeBackend()` coerces
-  `compressionBackend` to `"texconv"` on load whenever `runtime.GOOS == "darwin"`.
-  The Settings row is hidden on darwin rather than shown disabled. Callers
-  must check `EmbeddedTools.CompressonatorPath == ""` for availability rather
-  than `runtime.GOOS` — mirrors how the lockfile / Job-Object process split is
-  keyed off feature availability rather than raw OS checks.
+- **compressonator-bc7e ships on all three platforms.** The macOS binary is
+  built from source rather than taken from the fork's releases; see "Building
+  compressonator-bc7e for macOS" under Embedded Binaries, and do not rebuild it
+  with an arm64 ISPC. Availability is still expressed as
+  `EmbeddedTools.CompressonatorPath == ""` rather than a `runtime.GOOS` test —
+  mirrors how the lockfile / Job-Object process split is keyed off feature
+  availability rather than raw OS checks, and it is what a future platform
+  without a build would rely on.

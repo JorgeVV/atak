@@ -23,7 +23,8 @@ Grab the latest binary for your platform from [Releases](https://github.com/nois
 |---|---|
 | Linux x86-64 | `atak-vX.X.X-linux-x64.tar.gz` |
 | Windows x86-64 | `atak-vX.X.X-windows-x64.zip` |
-| macOS (Intel + Apple Silicon) | `atak-vX.X.X-macos.tar.gz` |
+| macOS Apple Silicon | `atak-vX.X.X-macos-arm64.tar.gz` |
+| macOS Intel | `atak-vX.X.X-macos-x64.tar.gz` |
 
 No installation required.
 
@@ -283,7 +284,7 @@ for S.T.A.L.K.E.R. Anomaly maintained by Grok. Join the community on
 - [Bubbles](https://github.com/charmbracelet/bubbles) — MIT — Charmbracelet
 - [Lip Gloss](https://github.com/charmbracelet/lipgloss) — MIT — Charmbracelet
 
-The optional compressonator-bc7e compression backend (Windows/Linux) additionally
+The optional compressonator-bc7e compression backend additionally
 incorporates:
 
 - [AMD Compressonator](https://github.com/GPUOpen-Tools/compressonator) — MIT — © 2024 Advanced Micro Devices, Inc.; © 2004-2006 ATI Technologies Inc.
