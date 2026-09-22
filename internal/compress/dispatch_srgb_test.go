@@ -24,7 +24,10 @@ func repoToolPath(t *testing.T, stem string) string {
 	var suffix string
 	switch runtime.GOOS {
 	case "darwin":
-		suffix = "-macos"
+		// The darwin binaries are embedded per GOARCH (see embed_darwin_*.go), so
+		// the file on disk carries the architecture too. Without it this helper
+		// resolved a path that never exists and every real-binary test skipped.
+		suffix = "-macos-" + runtime.GOARCH
 	case "linux":
 		suffix = "-linux"
 	case "windows":
@@ -162,13 +165,8 @@ func TestDispatchCompressonatorSrgbFallback(t *testing.T) {
 // Uses the same DX10 sRGB header but truncates before pixel data so texconv
 // also fails.
 func TestDispatchDoubleFailureCombinedStderr(t *testing.T) {
-	compressBin := "/home/abhi/stalker-tex/internal/tools/bin/compressonator-bc7e-linux"
-	texconvBin := "/home/abhi/stalker-tex/internal/tools/bin/texconv-linux"
-	for _, p := range []string{compressBin, texconvBin} {
-		if _, err := os.Stat(p); err != nil {
-			t.Skipf("binary missing: %v", err)
-		}
-	}
+	compressBin := repoToolPath(t, "compressonator-bc7e")
+	texconvBin := repoToolPath(t, "texconv")
 
 	src := writeFixture(t, "srgb_dx10_truncated.dds", synthSrgbDX10DDS(false))
 	job := Job{

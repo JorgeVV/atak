@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +22,7 @@ const (
 	FallbackBC7ToBC3      = "bc7-to-bc3"                  // texconv exit≠0 on BC7 → retried BC3
 	FallbackResize        = "compressonator-resize"       // compressonator can't -w/-h → routed to texconv
 	FallbackReaderGap     = "compressonator-reader-gap"   // compressonator DDS reader rejected → retried texconv
+	FallbackBlockAlign    = "block-align"                 // source dims not a multiple of 4 → resized so the engine's loader never re-encodes
 )
 
 // FallbackLabel returns a human-readable label for a fallback reason.
@@ -31,9 +31,11 @@ func FallbackLabel(reason string) string {
 	case FallbackBC7ToBC3:
 		return "BC7 → BC3 (texconv encoder rejected BC7)"
 	case FallbackResize:
-		return "compressonator-bc7e → texconv (maxTextureSize resize)"
+		return "resized to fit maxTextureSize"
 	case FallbackReaderGap:
 		return "compressonator-bc7e → texconv (DDS reader gap)"
+	case FallbackBlockAlign:
+		return "resized to a multiple of 4 (block alignment)"
 	}
 	return reason
 }
@@ -71,6 +73,53 @@ func (b *TexconvBackend) Compress(ctx context.Context, job Job) CompressionResul
 	return r
 }
 
+// resampleFormat is the intermediate the resize step writes. Uncompressed RGBA
+// is a superset of every source format in this corpus (RAW32, RAW24, DXT1, DXT5,
+// BC7), so the encoder that reads it back loses nothing the one-step path would
+// have kept. None of the sources use an _SRGB format, so no gamma conversion is
+// involved; a measured one-step/two-step comparison on a 658x493 icon showed a
+// signed mean channel difference of -0.05 of 255, which is ordinary BC7 encoder
+// variation rather than a color shift.
+const resampleFormat = "R8G8B8A8_UNORM"
+
+// Resample writes an uncompressed copy of asset at exactly width x height into
+// outDir and returns the path it wrote.
+//
+// It exists so a backend that encodes far faster than texconv but cannot resize
+// still gets to do the encoding. texconv handles only the resample, which is
+// nearly free, and the fast encoder reads the result. Measured on a 658x493 UI
+// icon from the corpus: letting texconv encode BC7 as well costs 27.9 s, while
+// resample plus compressonator-bc7e costs 0.09 s, because DirectXTex's BC7 codec
+// is scalar and single threaded while bc7e.ispc is SIMD and multithreaded. Across
+// the 332 misaligned sources in one GAMMA modlist that is the difference between
+// a few seconds and a few hours.
+//
+// The intermediate is always single-mip: the encoder rebuilds the chain from the
+// resized top level, which is what it would have done from the source.
+func (b *TexconvBackend) Resample(ctx context.Context, asset scan.Asset, width, height int, outDir string) (string, string, error) {
+	if width <= 0 || height <= 0 {
+		return "", "", fmt.Errorf("resample: bad target size %dx%d", width, height)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return "", "", err
+	}
+	success, stderr, runErr, _ := runOnce(ctx, b.Path, asset.Path, resampleFormat, false, width, height, outDir)
+	if !success {
+		if runErr == nil {
+			runErr = fmt.Errorf("resample: texconv produced no output")
+		}
+		return "", stderr, runErr
+	}
+	// texconv always lowercases the output extension, so a "foo.DDS" source
+	// lands as "foo.dds" and looking for the original spelling would miss it.
+	base := filepath.Base(asset.Path)
+	out := filepath.Join(outDir, strings.TrimSuffix(base, filepath.Ext(base))+".dds")
+	if _, err := os.Stat(out); err != nil {
+		return "", stderr, err
+	}
+	return out, stderr, nil
+}
+
 // Run invokes texconv on a single asset and returns the result.
 // If format is BC7_UNORM and texconv exits non-zero, automatically retries with BC3_UNORM.
 // outputDir should be filepath.Dir(asset.Path) for in-place compression.
@@ -81,29 +130,22 @@ func Run(ctx context.Context, texconvPath string, asset scan.Asset, format strin
 		return CompressionResult{Asset: asset, Success: false, Err: err}
 	}
 
-	// texconv -w/-h are exact, not maximums — compute both target dimensions explicitly
-	// to preserve aspect ratio. Scale by the larger dimension so neither axis exceeds
-	// maxTextureSize; guard asset.Width/Height > 0 to avoid division by zero on
-	// malformed headers (dimensions were 0 before the scan fix and fell through silently).
-	targetW, targetH := 0, 0
-	if maxTextureSize > 0 && asset.Width > 0 && asset.Height > 0 &&
-		(asset.Width > maxTextureSize || asset.Height > maxTextureSize) {
-		if asset.Width >= asset.Height {
-			targetW = maxTextureSize
-			targetH = int(math.Round(float64(asset.Height) * float64(maxTextureSize) / float64(asset.Width)))
-		} else {
-			targetH = maxTextureSize
-			targetW = int(math.Round(float64(asset.Width) * float64(maxTextureSize) / float64(asset.Height)))
-		}
-	}
+	// texconv -w/-h are exact, not maximums, so planResize computes both axes
+	// explicitly: it holds the aspect ratio under a maxTextureSize budget and rounds
+	// a block-compressed target to a multiple of 4. A zero plan passes no -w/-h and
+	// leaves the source size alone. dispatch() uses the same function to decide
+	// whether compressonator can take the job at all, so the two can't disagree.
+	plan := planResize(asset, format, maxTextureSize)
 
 	actualFormat := format
-	success, stderr, runErr, after := runOnce(ctx, texconvPath, asset.Path, format, generateMips, targetW, targetH, outputDir)
+	success, stderr, runErr, after := runOnce(ctx, texconvPath, asset.Path, format, generateMips, plan.Width, plan.Height, outputDir)
 
 	// BC7 fallback — only if ctx is still live (not a cancellation failure).
 	if !success && format == "BC7_UNORM" && ctx.Err() == nil {
 		actualFormat = "BC3_UNORM"
-		success, stderr, runErr, after = runOnce(ctx, texconvPath, asset.Path, "BC3_UNORM", generateMips, targetW, targetH, outputDir)
+		// The plan is unchanged: BC3 uses the same 4x4 block as BC7, so the
+		// aligned target is still the right one.
+		success, stderr, runErr, after = runOnce(ctx, texconvPath, asset.Path, "BC3_UNORM", generateMips, plan.Width, plan.Height, outputDir)
 	}
 
 	if ctx.Err() != nil {
@@ -132,9 +174,16 @@ func Run(ctx context.Context, texconvPath string, asset scan.Asset, format strin
 			os.Rename(texconvOut, asset.Path)
 		}
 	}
+	// A changed format is the more important thing to report, so it wins when both
+	// happened. Attributing the alignment resize here rather than in dispatch()
+	// means it is reported whichever backend is configured, since a texconv-primary
+	// run never goes through dispatch's fallback path at all.
 	var fallback string
-	if actualFormat != format {
+	switch {
+	case actualFormat != format:
 		fallback = FallbackBC7ToBC3
+	case plan.Aligned:
+		fallback = FallbackBlockAlign
 	}
 	return CompressionResult{
 		Asset:          asset,

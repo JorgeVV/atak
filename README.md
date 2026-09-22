@@ -73,7 +73,7 @@ Disable Mod Output Mode in Settings. Then follow the backup-first workflow below
 - ATAK was tested with G.A.M.M.A but should support most mods and mod packs. Feel free to report any bugs in the issue tracker.
 - Texconv does not support GPU acceleration on Linux, and will likely take several hours to complete. I highly recommend using compressonator_bc7e instead.
 - compressonator_bc7e is SIMD enabled and will very aggressively utilize your CPU cores. We highly reccomend killing background processes and setting your worker threads to 1-2.
-- UI and Icon textures are incompatibile with BC7 in the xray-monolith engine. We recommend leaving them as 'BC3_UNORM'
+- BC7 is not incompatible with the xray-monolith engine, but any block-compressed texture whose width or height is not a multiple of 4 is expensive to load. `d3dx11_43.dll` rounds those dimensions up, which forces a decode, resize and re-encode through Microsoft's 2010 reference encoder on first bind. For BC7 that costs seconds to minutes per texture and shows up as the game freezing when a UI window opens. UI art is authored at arbitrary sizes, so this lands on `textures/ui/` most often. ATAK now resizes those textures to a multiple of 4 during compression, which is the same resize the engine would do at load time, so BC7 is safe for UI profiles again.
 
 ### Backups
 
@@ -217,7 +217,7 @@ Controls which textures get compressed and how. Created on first run from embedd
 - `name` — display name in scan results
 - `format` — compression format. See table above
 - `generateMips` — mip-chain **policy**, not an on/off switch. `true` forces a full chain — use for world textures (diffuse, normals, weapons, terrain, sky) that minify with distance. `false` **preserves the source's own choice**: a source that shipped mips (many flares, scope reticles) keeps its chain, one that didn't (most flat UI art) stays single-level. Set the `stripMipsWhenDisabled` config option to make `false` strip unconditionally instead
-- `maxTextureSize` — cap output resolution. `0` = no limit. Set to `1024` on sky/terrain profiles for 4GB VRAM cards. Textures smaller than this value are never upscaled
+- `maxTextureSize` — cap output resolution. `0` = no limit. Set to `1024` on sky/terrain profiles for 4GB VRAM cards. Textures smaller than this value are never scaled up to it. Block alignment is separate and can still round a dimension up by as much as 3 pixels
 - `patterns` — glob patterns matched against filename or full path
 - `exclude` — optional. A file matching this profile's `patterns` **and** its `exclude` is declined by this profile, and matching continues with later profiles. Use it to route exceptions elsewhere — Normal Maps declines `*scope*bump*` so scope lens bumps fall through to Scope Textures (BC7) instead of being flattened to two-channel BC5. To drop a file outright, use the top-level `excludePatterns` instead
 
